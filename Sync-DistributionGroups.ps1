@@ -356,8 +356,7 @@ Department -like '*'
         }
         $usersByDept[$key].Add($u)
         if ($u.EmployeeNumber) {
-            $empKey = $u.EmployeeNumber.ToString().Trim() -replace '^0+', ''
-            if ($empKey) { $usersByEmpNum[$empKey] = $u }
+            $usersByEmpNum[$u.EmployeeNumber.ToString().Trim()] = $u
         }
     }
 
