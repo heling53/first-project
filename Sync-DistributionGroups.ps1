@@ -305,7 +305,7 @@ try {
                 foreach ($row in $excelData) {
                     $childName  = if ($row.objFullName) { $row.objFullName.ToString().Trim() } else { $null }
                     $parentName = if ($row.objName)     { $row.objName.ToString().Trim() }     else { $null }
-                    $managerEN  = if ($row.'Руководитель подразделения') { $row.'Руководитель подразделения'.ToString().Trim() } else { $null }
+                    $managerEN  = if ($row.'Руководитель подразделения') { ($row.'Руководитель подразделения'.ToString().Trim() -replace '^0+', '') } else { $null }
 
                     if ($row.orgUnitId -and $childName) {
                         $excelDeptById[$row.orgUnitId.ToString().Trim()] = $childName
@@ -356,7 +356,8 @@ Department -like '*'
         }
         $usersByDept[$key].Add($u)
         if ($u.EmployeeNumber) {
-            $usersByEmpNum[$u.EmployeeNumber.ToString().Trim()] = $u
+            $empKey = $u.EmployeeNumber.ToString().Trim() -replace '^0+', ''
+            if ($empKey) { $usersByEmpNum[$empKey] = $u }
         }
     }
 
@@ -399,6 +400,14 @@ Department -like '*'
                 if ($_.Exception.Message -notmatch 'already a member') {
                     Write-Log "Add manager fail $($group.Name): $($_.Exception.Message)" 'ERROR'
                 }
+            }
+        }
+        if ($PSCmdlet.ShouldProcess($group.Name, "Set ManagedBy=$($manager.SamAccountName)")) {
+            try {
+                Set-ADGroup -Identity $group -ManagedBy $manager.DistinguishedName -Server $DcServer
+                Write-Log "ManagedBy: $($group.Name) <- $($manager.SamAccountName)" 'OK'
+            } catch {
+                Write-Log "Set ManagedBy fail $($group.Name): $($_.Exception.Message)" 'ERROR'
             }
         }
     }
