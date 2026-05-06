@@ -17,10 +17,8 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$JsonFilePath            = 'C:\ProgramData\UniversalAutomation\departments.json',
-    [string]$CsvFilePath             = 'D:\Scripts\DistributionGroups\ImportedDeps.csv',
     [string]$TargetOU                = 'OU=Группы рассылки,DC=transitcard,DC=ru',
     [string]$GroupDesc               = 'Группа рассылки подразделения_v1.0',
-    [string]$CsvDelimiter            = ',',
     [string]$MailDomain              = 'transitcard.ru',
     [string]$ExchangeServer          = 'srv-ex16-01.transitcard.ru',
     [string]$DcServer                = 'srv-dc3.transitcard.ru',
@@ -292,6 +290,43 @@ try {
     }
 
     # ==========================================
+    # Загрузка данных 1С (Excel) — иерархия, руководители, ID для аудита
+    # ==========================================
+    $excelDeptById  = @{}
+    $excelHierarchy = New-Object System.Collections.Generic.List[object]
+    $excelManagers  = New-Object System.Collections.Generic.List[object]
+    if (Test-Path $ExcelPath) {
+        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+            Write-Log "Модуль ImportExcel не установлен. Установите: Install-Module ImportExcel -Scope CurrentUser" 'WARN'
+        } else {
+            try {
+                Import-Module ImportExcel
+                $excelData = Import-Excel -Path $ExcelPath -StartRow 2
+                foreach ($row in $excelData) {
+                    $childName  = if ($row.objFullName) { $row.objFullName.ToString().Trim() } else { $null }
+                    $parentName = if ($row.objName)     { $row.objName.ToString().Trim() }     else { $null }
+                    $managerEN  = if ($row.'Руководитель подразделения') { $row.'Руководитель подразделения'.ToString().Trim() } else { $null }
+
+                    if ($row.orgUnitId -and $childName) {
+                        $excelDeptById[$row.orgUnitId.ToString().Trim()] = $childName
+                    }
+                    if ($childName -and $parentName -and ($childName -ne $parentName)) {
+                        $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
+                    }
+                    if ($childName -and $managerEN) {
+                        $excelManagers.Add([PSCustomObject]@{ Department = $childName; EmployeeNumber = $managerEN })
+                    }
+                }
+                Write-Log "1С: подразделений=$($excelDeptById.Count), иерархия=$($excelHierarchy.Count), руководителей=$($excelManagers.Count)" 'OK'
+            } catch {
+                Write-Log "Ошибка чтения Excel: $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    } else {
+        Write-Log "Excel $ExcelPath не найден." 'WARN'
+    }
+
+    # ==========================================
     # ШАГ 2. Наполнение пользователями (только добавление)
     # ==========================================
     Write-Log "Шаг 2: добавление пользователей" 'STEP'
@@ -312,13 +347,17 @@ Department -like '*'
                         -Properties Department, EmployeeNumber, Name `
                         -ResultPageSize 1000 -Server $DcServer
 
-    $usersByDept = @{}
+    $usersByDept   = @{}
+    $usersByEmpNum = @{}
     foreach ($u in $users) {
         $key = Normalize-Name $u.Department
         if (-not $usersByDept.ContainsKey($key)) {
             $usersByDept[$key] = New-Object System.Collections.Generic.List[object]
         }
         $usersByDept[$key].Add($u)
+        if ($u.EmployeeNumber) {
+            $usersByEmpNum[$u.EmployeeNumber.ToString().Trim()] = $u
+        }
     }
 
     foreach ($g in $managedGroups) {
@@ -338,61 +377,57 @@ Department -like '*'
     }
 
     # ==========================================
-    # ШАГ 3. Иерархия из CSV
+    # ШАГ 2.1. Добавление руководителей подразделений из 1С
     # ==========================================
-    Write-Log "Шаг 3: иерархия (порог $FuzzyMatchThreshold)" 'STEP'
-    if (Test-Path $CsvFilePath) {
-        $csvData = Import-Csv -Path $CsvFilePath -Delimiter $CsvDelimiter `
-                              -Header 'ID', 'Child', 'Parent' -Encoding UTF8 |
-                   Select-Object -Skip 1
-        foreach ($row in $csvData) {
-            $parentName = if ($row.Parent) { $row.Parent.Trim() } else { $null }
-            $childName  = if ($row.Child)  { $row.Child.Trim()  } else { $null }
-            $parent = Find-BestGroupMatch -SearchName $parentName -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
-            $child  = Find-BestGroupMatch -SearchName $childName  -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
-            if (-not $parent) { Write-Log "Родитель '$parentName' не найден" 'WARN'; continue }
-            if (-not $child)  { Write-Log "Потомок '$childName' не найден"  'WARN'; continue }
+    Write-Log "Шаг 2.1: руководители подразделений" 'STEP'
+    foreach ($m in $excelManagers) {
+        if (-not $usersByEmpNum.ContainsKey($m.EmployeeNumber)) {
+            Write-Log "Руководитель EmployeeNumber=$($m.EmployeeNumber) для '$($m.Department)' не найден в AD" 'WARN'
+            continue
+        }
+        $manager = $usersByEmpNum[$m.EmployeeNumber]
+        $group = Find-BestGroupMatch -SearchName $m.Department -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
+        if (-not $group) {
+            Write-Log "Группа подразделения '$($m.Department)' не найдена" 'WARN'
+            continue
+        }
+        if ($PSCmdlet.ShouldProcess($group.Name, "Add manager $($manager.SamAccountName)")) {
             try {
-                if ($PSCmdlet.ShouldProcess("$($child.Name) -> $($parent.Name)", "Add child group")) {
-                    Add-ADGroupMember -Identity $parent -Members $child -Server $DcServer -ErrorAction Stop
-                    Write-Log "Иерархия: $($child.Name) -> $($parent.Name)" 'OK'
-                }
+                Add-ADGroupMember -Identity $group -Members $manager.DistinguishedName -Server $DcServer -ErrorAction Stop
+                Write-Log "Руководитель $($manager.SamAccountName) -> $($group.Name)" 'OK'
             } catch {
                 if ($_.Exception.Message -notmatch 'already a member') {
-                    Write-Log "Иерархия fail: $($_.Exception.Message)" 'ERROR'
+                    Write-Log "Add manager fail $($group.Name): $($_.Exception.Message)" 'ERROR'
                 }
             }
         }
-    } else {
-        Write-Log "CSV $CsvFilePath не найден." 'WARN'
+    }
+
+    # ==========================================
+    # ШАГ 3. Иерархия из 1С (Excel)
+    # ==========================================
+    Write-Log "Шаг 3: иерархия (порог $FuzzyMatchThreshold)" 'STEP'
+    foreach ($row in $excelHierarchy) {
+        $parent = Find-BestGroupMatch -SearchName $row.Parent -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
+        $child  = Find-BestGroupMatch -SearchName $row.Child  -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
+        if (-not $parent) { Write-Log "Родитель '$($row.Parent)' не найден" 'WARN'; continue }
+        if (-not $child)  { Write-Log "Потомок '$($row.Child)' не найден"  'WARN'; continue }
+        try {
+            if ($PSCmdlet.ShouldProcess("$($child.Name) -> $($parent.Name)", "Add child group")) {
+                Add-ADGroupMember -Identity $parent -Members $child -Server $DcServer -ErrorAction Stop
+                Write-Log "Иерархия: $($child.Name) -> $($parent.Name)" 'OK'
+            }
+        } catch {
+            if ($_.Exception.Message -notmatch 'already a member') {
+                Write-Log "Иерархия fail: $($_.Exception.Message)" 'ERROR'
+            }
+        }
     }
 
     # ==========================================
     # ШАГ 3.1. Аудит переименований из 1С
     # ==========================================
     Write-Log "Шаг 3.1: аудит переименований" 'STEP'
-    $excelDeptById = @{}
-    if (Test-Path $ExcelPath) {
-        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-            Write-Log "Модуль ImportExcel не установлен. Установите: Install-Module ImportExcel -Scope CurrentUser" 'WARN'
-        } else {
-            try {
-                Import-Module ImportExcel
-                $excelData = Import-Excel -Path $ExcelPath -StartRow 2
-                foreach ($row in $excelData) {
-                    if ($row.orgUnitId -and $row.objFullName) {
-                        $excelDeptById[$row.orgUnitId.ToString().Trim()] = $row.objFullName.ToString().Trim()
-                    }
-                }
-                Write-Log "Загружено $($excelDeptById.Count) подразделений из 1С." 'OK'
-            } catch {
-                Write-Log "Ошибка чтения Excel: $($_.Exception.Message)" 'ERROR'
-            }
-        }
-    } else {
-        Write-Log "Excel $ExcelPath не найден." 'WARN'
-    }
-
     $report = New-Object System.Collections.Generic.List[object]
     foreach ($g in $managedGroups) {
         $email = if ($g.mail) { $g.mail.ToLowerInvariant().Trim() } else { $null }
