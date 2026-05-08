@@ -27,6 +27,8 @@ param(
     [string]$ExcelPath               = 'D:\Scripts\verify1C\1c\Подразделения.xlsx',
     [string]$ReportCsvPath           = 'D:\Scripts\Группы рассылки\RenameReport.csv',
     [string]$LogPath                 = 'D:\Scripts\Группы рассылки\Logs',
+    [string]$SyncDepartmentsScript   = 'D:\Scripts\Группы рассылки\Sync-Departments.ps1',
+    [int]$PostExportWaitSeconds      = 3,
     [int]$SamMaxLength               = 20
 )
 
@@ -57,6 +59,23 @@ function Write-Log {
         'STEP'  { 'Cyan' }; 'DEBUG' { 'DarkGray' }; default { 'Gray' }
     }
     Write-Host ("[{0:HH:mm:ss}] [{1}] {2}" -f (Get-Date), $Level, $Message) -ForegroundColor $color
+}
+
+# ==========================================
+# Обновление departments.json (запуск экспортного скрипта)
+# ==========================================
+if (Test-Path $SyncDepartmentsScript) {
+    Write-Log "Запуск $SyncDepartmentsScript ..." 'STEP'
+    try {
+        & $SyncDepartmentsScript
+        Write-Log "Экспорт подразделений завершён, ожидание $PostExportWaitSeconds сек." 'OK'
+        Start-Sleep -Seconds $PostExportWaitSeconds
+    } catch {
+        Write-Log "Ошибка экспорта подразделений: $($_.Exception.Message)" 'ERROR'
+        throw
+    }
+} else {
+    Write-Log "Скрипт обновления подразделений не найден: $SyncDepartmentsScript" 'WARN'
 }
 
 # ==========================================
