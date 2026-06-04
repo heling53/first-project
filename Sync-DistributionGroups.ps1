@@ -3,20 +3,23 @@
 
 <#
 .SYNOPSIS
-    Синхронизация групп рассылки AD/Exchange с источником подразделений (JSON + 1С).
+    Синхронизация групп рассылки AD/Exchange со справочником подразделений 1С (Подразделения.xlsx).
 .DESCRIPTION
-    Создаёт/наполняет/удаляет группы рассылки на основе:
-      - departments.json   — список актуальных подразделений;
-      - ImportedDeps.csv   — иерархия (parent/child);
-      - protected_groups.json — защита от удаления + аудит переименований;
-      - Подразделения.xlsx — справочник 1С для сверки имён.
+    Единственный источник данных о подразделениях — Подразделения.xlsx (выгрузка 1С).
+    Из него берутся:
+      - уникальные подразделения  — для создания групп рассылки (колонки objFullName/objName);
+      - иерархия (parent/child)    — для вложенности групп (objName -> objFullName);
+      - руководители подразделений — колонка «Руководитель подразделения» (табельный номер);
+      - orgUnitId                  — для аудита переименований (extensionAttribute1).
+    Дополнительно:
+      - protected_groups.json — защита от удаления + аудит переименований.
+    Пользователи берутся из AD и распределяются по группам по названию подразделения.
 .NOTES
     Все операции выполняются на одном DC ($DcServer), read-after-write согласован.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$JsonFilePath            = 'C:\ProgramData\UniversalAutomation\departments.json',
     [string]$TargetOU                = 'OU=Группы рассылки,DC=transitcard,DC=ru',
     [string]$GroupDesc               = 'Группа рассылки подразделения_v1.0',
     [string]$MailDomain              = 'transitcard.ru',
@@ -27,8 +30,6 @@ param(
     [string]$ExcelPath               = 'D:\Scripts\verify1C\1c\Подразделения.xlsx',
     [string]$ReportCsvPath           = 'D:\Scripts\Группы рассылки\RenameReport.csv',
     [string]$LogPath                 = 'D:\Scripts\Группы рассылки\Logs',
-    [string]$SyncDepartmentsScript   = 'D:\Scripts\Группы рассылки\Sync-Departments.ps1',
-    [int]$PostExportWaitSeconds      = 3,
     [int]$SamMaxLength               = 20
 )
 
@@ -59,23 +60,6 @@ function Write-Log {
         'STEP'  { 'Cyan' }; 'DEBUG' { 'DarkGray' }; default { 'Gray' }
     }
     Write-Host ("[{0:HH:mm:ss}] [{1}] {2}" -f (Get-Date), $Level, $Message) -ForegroundColor $color
-}
-
-# ==========================================
-# Обновление departments.json (запуск экспортного скрипта)
-# ==========================================
-if (Test-Path $SyncDepartmentsScript) {
-    Write-Log "Запуск $SyncDepartmentsScript ..." 'STEP'
-    try {
-        & $SyncDepartmentsScript
-        Write-Log "Экспорт подразделений завершён, ожидание $PostExportWaitSeconds сек." 'OK'
-        Start-Sleep -Seconds $PostExportWaitSeconds
-    } catch {
-        Write-Log "Ошибка экспорта подразделений: $($_.Exception.Message)" 'ERROR'
-        throw
-    }
-} else {
-    Write-Log "Скрипт обновления подразделений не найден: $SyncDepartmentsScript" 'WARN'
 }
 
 # ==========================================
@@ -211,24 +195,65 @@ try {
     }
 
     # ==========================================
-    # ШАГ 1. Создание групп из JSON
+    # Загрузка справочника 1С (Подразделения.xlsx) — единственный источник.
+    # Отсюда: уникальные отделы, иерархия, руководители, ID для аудита.
     # ==========================================
-    Write-Log "Шаг 1: создание групп из JSON" 'STEP'
-    if (-not (Test-Path $JsonFilePath)) { throw "JSON файл $JsonFilePath не найден." }
-
-    $jsonContent = Get-Content -Path $JsonFilePath -Raw | ConvertFrom-Json
-    $departments = @()
-    if ($jsonContent -is [array] -and $jsonContent.Count -gt 0 -and $jsonContent[0] -is [string]) {
-        $departments = $jsonContent
-    } elseif ($jsonContent.department) {
-        $departments = $jsonContent.department
-    } else {
-        $departments = $jsonContent | Select-Object -ExpandProperty department -ErrorAction SilentlyContinue
+    Write-Log "Загрузка справочника 1С: $ExcelPath" 'STEP'
+    if (-not (Test-Path $ExcelPath)) {
+        throw "Справочник подразделений не найден: $ExcelPath"
     }
-    $departments = $departments |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object { ($_ -replace '\s+', ' ').Trim() } |
-        Select-Object -Unique
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        throw "Модуль ImportExcel не установлен. Установите: Install-Module ImportExcel -Scope CurrentUser"
+    }
+    Import-Module ImportExcel
+
+    $excelDeptById  = @{}
+    $excelHierarchy = New-Object System.Collections.Generic.List[object]
+    $excelManagers  = New-Object System.Collections.Generic.List[object]
+    $departmentList = New-Object System.Collections.Generic.List[string]
+    $seenDept       = @{}   # нормализованное имя -> $true (дедупликация)
+
+    $excelData = Import-Excel -Path $ExcelPath -StartRow 2
+    foreach ($row in $excelData) {
+        $childName  = if ($row.objFullName) { ($row.objFullName.ToString() -replace '\s+', ' ').Trim() } else { $null }
+        $parentName = if ($row.objName)     { ($row.objName.ToString()     -replace '\s+', ' ').Trim() } else { $null }
+        $managerEN  = if ($row.'Руководитель подразделения') { ($row.'Руководитель подразделения'.ToString().Trim() -replace '^0+', '') } else { $null }
+
+        if ($row.orgUnitId -and $childName) {
+            $excelDeptById[$row.orgUnitId.ToString().Trim()] = $childName
+        }
+        if ($childName -and $parentName -and ($childName -ne $parentName)) {
+            $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
+        }
+        if ($childName -and $managerEN) {
+            $excelManagers.Add([PSCustomObject]@{ Department = $childName; EmployeeNumber = $managerEN })
+        }
+
+        # Уникальные подразделения: и сам узел (objFullName), и его родитель (objName),
+        # чтобы для любого уровня иерархии существовала группа.
+        foreach ($name in @($childName, $parentName)) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                $norm = Normalize-Name $name
+                if (-not $seenDept.ContainsKey($norm)) {
+                    $seenDept[$norm] = $true
+                    $departmentList.Add($name)
+                }
+            }
+        }
+    }
+
+    $departments = $departmentList | Sort-Object
+    Write-Log ("1С: отделов={0}, иерархия={1}, руководителей={2}" -f `
+        @($departments).Count, $excelHierarchy.Count, $excelManagers.Count) 'OK'
+
+    if (@($departments).Count -eq 0) {
+        throw "Из $ExcelPath не получено ни одного подразделения (проверьте колонки objFullName/objName и -StartRow)."
+    }
+
+    # ==========================================
+    # ШАГ 1. Создание групп из справочника 1С
+    # ==========================================
+    Write-Log "Шаг 1: создание групп из справочника 1С" 'STEP'
 
     # Один запрос: все управляемые группы в OU
     $existingGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
@@ -242,13 +267,15 @@ try {
     }
 
     foreach ($dept in $departments) {
-        if ($groupsByName.ContainsKey($dept)) { continue }
-
+        # Имя группы (AD ограничивает CN 64 символами) определяем до проверки наличия,
+        # чтобы длинные имена не пытались пересоздаваться на каждом запуске.
         $groupName = $dept
         if ($groupName.Length -gt 64) {
             $groupName = $groupName.Substring(0, 64)
             Write-Log "Имя группы обрезано до 64 символов: '$groupName'" 'WARN'
         }
+
+        if ($groupsByName.ContainsKey($groupName)) { continue }
 
         $latin = Convert-CyrillicToLatin -Text (Get-Initials -Text $dept)
         $base  = ('DG_' + $latin).ToUpper()
@@ -309,43 +336,6 @@ try {
     }
 
     # ==========================================
-    # Загрузка данных 1С (Excel) — иерархия, руководители, ID для аудита
-    # ==========================================
-    $excelDeptById  = @{}
-    $excelHierarchy = New-Object System.Collections.Generic.List[object]
-    $excelManagers  = New-Object System.Collections.Generic.List[object]
-    if (Test-Path $ExcelPath) {
-        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-            Write-Log "Модуль ImportExcel не установлен. Установите: Install-Module ImportExcel -Scope CurrentUser" 'WARN'
-        } else {
-            try {
-                Import-Module ImportExcel
-                $excelData = Import-Excel -Path $ExcelPath -StartRow 2
-                foreach ($row in $excelData) {
-                    $childName  = if ($row.objFullName) { $row.objFullName.ToString().Trim() } else { $null }
-                    $parentName = if ($row.objName)     { $row.objName.ToString().Trim() }     else { $null }
-                    $managerEN  = if ($row.'Руководитель подразделения') { ($row.'Руководитель подразделения'.ToString().Trim() -replace '^0+', '') } else { $null }
-
-                    if ($row.orgUnitId -and $childName) {
-                        $excelDeptById[$row.orgUnitId.ToString().Trim()] = $childName
-                    }
-                    if ($childName -and $parentName -and ($childName -ne $parentName)) {
-                        $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
-                    }
-                    if ($childName -and $managerEN) {
-                        $excelManagers.Add([PSCustomObject]@{ Department = $childName; EmployeeNumber = $managerEN })
-                    }
-                }
-                Write-Log "1С: подразделений=$($excelDeptById.Count), иерархия=$($excelHierarchy.Count), руководителей=$($excelManagers.Count)" 'OK'
-            } catch {
-                Write-Log "Ошибка чтения Excel: $($_.Exception.Message)" 'ERROR'
-            }
-        }
-    } else {
-        Write-Log "Excel $ExcelPath не найден." 'WARN'
-    }
-
-    # ==========================================
     # ШАГ 2. Наполнение пользователями (только добавление)
     # ==========================================
     Write-Log "Шаг 2: добавление пользователей" 'STEP'
@@ -380,9 +370,10 @@ Department -like '*'
     }
 
     foreach ($g in $managedGroups) {
-        $key = Normalize-Name $g.Name
-        $desired = if ($usersByDept.ContainsKey($key)) { $usersByDept[$key] } else { @() }
-        if ($desired.Count -eq 0) { continue }
+        # Точное совпадение по имени подразделения, иначе нечёткое (порог $FuzzyMatchThreshold):
+        # имена групп берутся из 1С и могут немного отличаться от атрибута Department в AD.
+        $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $usersByDept -Threshold $FuzzyMatchThreshold
+        if (-not $desired -or @($desired).Count -eq 0) { continue }
         $desiredDNs = @($desired | ForEach-Object { $_.DistinguishedName })
         $toAdd = $desiredDNs | Where-Object { $_ -and ($g.Member -notcontains $_) }
         if ($toAdd.Count -gt 0) {
