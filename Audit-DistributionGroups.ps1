@@ -558,6 +558,15 @@ function Find-ObsoleteGroups {
 }
 
 # ========== ФУНКЦИЯ ФОРМИРОВАНИЯ HTML-ТАБЛИЦЫ СВОДКИ ==========
+# Null-безопасный подсчёт записей.
+# Нужен потому, что функции возвращают пустой набор как $null (пустой List при выводе
+# разворачивается в 0 объектов), а @($null).Count = 1, а не 0. Measure-Object даёт
+# корректно: $null/пусто -> 0, скаляр -> 1, массив -> N.
+function Get-RecordCount {
+    param($Data)
+    return ($Data | Measure-Object).Count
+}
+
 function Get-SummaryHtmlTable {
     param(
         $NonCorrADGroup,
@@ -569,13 +578,13 @@ function Get-SummaryHtmlTable {
         $DGroupsToRename
     )
     $rows = @(
-        @{ Файл = "NonCorrADGroup.csv";         Описание = "Некорректно добавленные или несуществующие группы рассылки подразделений";          Записей = @($NonCorrADGroup).Count },
-        @{ Файл = "NCMUpload.csv";              Описание = "Записи о некорректном вхождении группы в вышестоящий список рассылки";                Записей = @($NCMUpload).Count },
-        @{ Файл = "NonCorrUserMembership.csv";  Описание = "Записи о некорректном вхождении пользователя в группу рассылки";                      Записей = @($NonCorrUserMembership).Count },
-        @{ Файл = "UserDepToAdd.csv";           Описание = "Записи для включения пользователей в группы рассылки";                                Записей = @($UserDepToAdd).Count },
-        @{ Файл = "UsersToExclude.csv";         Описание = "Записи о деактивированных пользователях, подлежащих исключению из группы";            Записей = @($UsersToExclude).Count },
-        @{ Файл = "DGroupsToDel.csv";           Описание = "Список групп рассылки, подлежащих удалению";                                          Записей = @($DGroupsToDel).Count },
-        @{ Файл = "DGroupsToRename.csv";        Описание = "Группы, требующие переименования";                                                    Записей = @($DGroupsToRename).Count }
+        @{ Файл = "NonCorrADGroup.csv";         Описание = "Некорректно добавленные или несуществующие группы рассылки подразделений";          Записей = (Get-RecordCount $NonCorrADGroup) },
+        @{ Файл = "NCMUpload.csv";              Описание = "Записи о некорректном вхождении группы в вышестоящий список рассылки";                Записей = (Get-RecordCount $NCMUpload) },
+        @{ Файл = "NonCorrUserMembership.csv";  Описание = "Записи о некорректном вхождении пользователя в группу рассылки";                      Записей = (Get-RecordCount $NonCorrUserMembership) },
+        @{ Файл = "UserDepToAdd.csv";           Описание = "Записи для включения пользователей в группы рассылки";                                Записей = (Get-RecordCount $UserDepToAdd) },
+        @{ Файл = "UsersToExclude.csv";         Описание = "Записи о деактивированных пользователях, подлежащих исключению из группы";            Записей = (Get-RecordCount $UsersToExclude) },
+        @{ Файл = "DGroupsToDel.csv";           Описание = "Список групп рассылки, подлежащих удалению";                                          Записей = (Get-RecordCount $DGroupsToDel) },
+        @{ Файл = "DGroupsToRename.csv";        Описание = "Группы, требующие переименования";                                                    Записей = (Get-RecordCount $DGroupsToRename) }
     )
     $html = "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>"
     $html += "<tr><th>Файл</th><th>Описание</th><th>Количество записей</th></tr>"
@@ -633,13 +642,13 @@ try {
 
     # 11. Подготовка вложений (только файлы, в которых есть данные)
     $Attachments = @()
-    if (@($NonCorrADGroup).Count -gt 0)        { $Attachments += $Csv_NonCorrADGroup }
-    if (@($NCMUpload).Count -gt 0)             { $Attachments += $Csv_NCMUpload }
-    if (@($NonCorrUserMembership).Count -gt 0) { $Attachments += $Csv_NonCorrUserMembership }
-    if (@($UserDepToAdd).Count -gt 0)          { $Attachments += $Csv_UserDepToAdd }
-    if (@($UsersToExclude).Count -gt 0)        { $Attachments += $Csv_UsersToExclude }
-    if (@($DGroupsToDel).Count -gt 0)          { $Attachments += $Csv_DGroupsToDel }
-    if (@($DGroupsToRename).Count -gt 0)       { $Attachments += $Csv_DGroupsToRename }
+    if ((Get-RecordCount $NonCorrADGroup) -gt 0)        { $Attachments += $Csv_NonCorrADGroup }
+    if ((Get-RecordCount $NCMUpload) -gt 0)             { $Attachments += $Csv_NCMUpload }
+    if ((Get-RecordCount $NonCorrUserMembership) -gt 0) { $Attachments += $Csv_NonCorrUserMembership }
+    if ((Get-RecordCount $UserDepToAdd) -gt 0)          { $Attachments += $Csv_UserDepToAdd }
+    if ((Get-RecordCount $UsersToExclude) -gt 0)        { $Attachments += $Csv_UsersToExclude }
+    if ((Get-RecordCount $DGroupsToDel) -gt 0)          { $Attachments += $Csv_DGroupsToDel }
+    if ((Get-RecordCount $DGroupsToRename) -gt 0)       { $Attachments += $Csv_DGroupsToRename }
 
     # 12. Отправка итогового письма
     Send-Notification -TableHtml $SummaryTableHtml -Attachments $Attachments
