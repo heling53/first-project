@@ -250,6 +250,15 @@ try {
         throw "Из $ExcelPath не получено ни одного подразделения (проверьте колонки objFullName/objName и -StartRow)."
     }
 
+    # Набор имён групп, которые ДОЛЖНЫ существовать по справочнику 1С.
+    # Ключи нормализованы и обрезаны до 64 символов — так же, как имена создаваемых групп,
+    # чтобы Шаг 4 не удалял пустые группы, реально присутствующие в 1С.
+    $excelGroupKeys = @{}
+    foreach ($d in $departments) {
+        $gn = if ($d.Length -gt 64) { $d.Substring(0, 64) } else { $d }
+        $excelGroupKeys[(Normalize-Name $gn)] = $true
+    }
+
     # ==========================================
     # ШАГ 1. Создание групп из справочника 1С
     # ==========================================
@@ -476,14 +485,25 @@ Department -like '*'
     }
 
     # ==========================================
-    # ШАГ 4. Удаление пустых групп (с учётом защиты)
+    # ШАГ 4. Удаление групп: только если ПУСТАЯ И отсутствует в справочнике 1С
     # ==========================================
-    Write-Log "Шаг 4: удаление пустых групп" 'STEP'
+    Write-Log "Шаг 4: удаление пустых групп, отсутствующих в 1С" 'STEP'
     $finalGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
                                -SearchBase $TargetOU -Server $DcServer `
                                -Properties Member, mail
     foreach ($g in $finalGroups) {
+        # 1) Не трогаем непустые группы
         if ($g.Member -and $g.Member.Count -gt 0) { continue }
+
+        # 2) Не удаляем, если подразделение есть в справочнике 1С (даже если группа сейчас пуста,
+        #    например новый отдел без сотрудников). Сверка с тем же нечётким порогом.
+        $inExcel = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $excelGroupKeys -Threshold $FuzzyMatchThreshold
+        if ($inExcel) {
+            Write-Log "Есть в 1С, пропуск удаления пустой группы: $($g.Name)" 'WARN'
+            continue
+        }
+
+        # 3) Не удаляем защищённые в protected_groups.json
         $email = if ($g.mail) { $g.mail.ToLowerInvariant().Trim() } else { $null }
         if ($email -and $protectedByEmail.ContainsKey($email)) {
             Write-Log "Защищена JSON, пропуск: $($g.Name) ($email)" 'WARN'
