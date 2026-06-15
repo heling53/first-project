@@ -30,7 +30,8 @@ param(
     [string]$ExcelPath               = 'D:\Scripts\verify1C\1c\Подразделения.xlsx',
     [string]$ReportCsvPath           = 'D:\Scripts\Группы рассылки\RenameReport.csv',
     [string]$LogPath                 = 'D:\Scripts\Группы рассылки\Logs',
-    [int]$SamMaxLength               = 20
+    [int]$SamMaxLength               = 20,
+    [string]$UsersCorpOU             = 'OU=Users.Corp,DC=transitcard,DC=ru'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -482,6 +483,71 @@ Department -like '*'
     if ($report.Count -gt 0) {
         $report | Export-Csv -Path $ReportCsvPath -NoTypeInformation -Encoding UTF8
         Write-Log "Отчёт: $ReportCsvPath ($($report.Count) записей)" 'OK'
+    }
+
+    # ==========================================
+    # ШАГ 3.2. Исключение: пользователи OU Users.Corp без EmployeeNumber
+    # ==========================================
+    # Шаг 2 жёстко требует EmployeeNumber, поэтому сотрудники без табельного номера
+    # в группы не попадают. Здесь, перед удалением пустых групп, добавляем исключение:
+    # пользователей из $UsersCorpOU, у которых всё остальное в порядке (включён,
+    # есть Department, не попадает под adm/vpn/test/KZ-исключения), но нет EmployeeNumber.
+    Write-Log "Шаг 3.2: исключение — пользователи $UsersCorpOU без EmployeeNumber" 'STEP'
+
+    $filterNoEmpNum = @"
+Department -like '*'
+  -and Enabled -eq 'True'
+  -and -not (EmployeeNumber -like '*')
+  -and SamAccountName -notlike 'adm-*'
+  -and SamAccountName -notlike 'vpn-*'
+  -and SamAccountName -notlike '*test*'
+  -and Name -notlike '*ADM*'
+  -and Name -notlike '*VPN*'
+  -and Name -notlike '*KZ*'
+"@ -replace "`r`n", " " -replace "`n", " "
+
+    $exceptionUsers = @()
+    try {
+        $exceptionUsers = Get-ADUser -Filter $filterNoEmpNum `
+                                     -SearchBase $UsersCorpOU `
+                                     -Properties Department, Name `
+                                     -ResultPageSize 1000 -Server $DcServer
+    } catch {
+        Write-Log "Не удалось получить пользователей из ${UsersCorpOU}: $($_.Exception.Message)" 'ERROR'
+    }
+
+    $exUsersByDept = @{}
+    foreach ($u in $exceptionUsers) {
+        $key = Normalize-Name $u.Department
+        if (-not $exUsersByDept.ContainsKey($key)) {
+            $exUsersByDept[$key] = New-Object System.Collections.Generic.List[object]
+        }
+        $exUsersByDept[$key].Add($u)
+    }
+    Write-Log ("Исключений найдено: {0} пользователей, {1} подразделений" -f `
+        @($exceptionUsers).Count, $exUsersByDept.Count) 'OK'
+
+    if ($exUsersByDept.Count -gt 0) {
+        # Перечитываем актуальный состав групп (после шагов 2/2.1/3), чтобы не дублировать.
+        $groupsForExcept = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
+                                       -SearchBase $TargetOU -Server $DcServer `
+                                       -Properties Member
+        foreach ($g in $groupsForExcept) {
+            $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $exUsersByDept -Threshold $FuzzyMatchThreshold
+            if (-not $desired -or @($desired).Count -eq 0) { continue }
+            $usersToAdd = @($desired | Where-Object { $_.DistinguishedName -and ($g.Member -notcontains $_.DistinguishedName) })
+            if ($usersToAdd.Count -gt 0) {
+                if ($PSCmdlet.ShouldProcess($g.Name, "Add $($usersToAdd.Count) users без EmployeeNumber")) {
+                    try {
+                        Add-ADGroupMember -Identity $g -Members @($usersToAdd.DistinguishedName) -Server $DcServer
+                        Write-Log "+$($usersToAdd.Count) (Users.Corp без EmpNum) -> $($g.Name)" 'OK'
+                        foreach ($u in $usersToAdd) {
+                            Write-Log "    $($u.SamAccountName) — $($u.Name)" 'OK'
+                        }
+                    } catch { Write-Log "Add fail (без EmpNum) $($g.Name): $($_.Exception.Message)" 'ERROR' }
+                }
+            }
+        }
     }
 
     # ==========================================
