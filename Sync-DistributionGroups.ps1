@@ -535,13 +535,15 @@ Department -like '*'
         foreach ($g in $groupsForExcept) {
             $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $exUsersByDept -Threshold $FuzzyMatchThreshold
             if (-not $desired -or @($desired).Count -eq 0) { continue }
-            $desiredDNs = @($desired | ForEach-Object { $_.DistinguishedName })
-            $toAdd = $desiredDNs | Where-Object { $_ -and ($g.Member -notcontains $_) }
-            if ($toAdd.Count -gt 0) {
-                if ($PSCmdlet.ShouldProcess($g.Name, "Add $($toAdd.Count) users без EmployeeNumber")) {
+            $usersToAdd = @($desired | Where-Object { $_.DistinguishedName -and ($g.Member -notcontains $_.DistinguishedName) })
+            if ($usersToAdd.Count -gt 0) {
+                if ($PSCmdlet.ShouldProcess($g.Name, "Add $($usersToAdd.Count) users без EmployeeNumber")) {
                     try {
-                        Add-ADGroupMember -Identity $g -Members $toAdd -Server $DcServer
-                        Write-Log "+$($toAdd.Count) (Users.Corp без EmpNum) -> $($g.Name)" 'OK'
+                        Add-ADGroupMember -Identity $g -Members @($usersToAdd.DistinguishedName) -Server $DcServer
+                        Write-Log "+$($usersToAdd.Count) (Users.Corp без EmpNum) -> $($g.Name)" 'OK'
+                        foreach ($u in $usersToAdd) {
+                            Write-Log "    $($u.SamAccountName) — $($u.Name)" 'OK'
+                        }
                     } catch { Write-Log "Add fail (без EmpNum) $($g.Name): $($_.Exception.Message)" 'ERROR' }
                 }
             }
