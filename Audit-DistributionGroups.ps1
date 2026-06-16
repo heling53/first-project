@@ -444,9 +444,18 @@ function Find-ObsoleteGroups {
         # Группа актуальна, если её имя (CN или DisplayName) есть среди подразделений 1С.
         if ($currentDepNames.ContainsKey($cn) -or $currentDepNames.ContainsKey($dn)) { continue }
 
+        # Причина удаления.
+        $reason =
+            if ([string]::IsNullOrWhiteSpace($cn) -and [string]::IsNullOrWhiteSpace($dn)) {
+                'У группы пустые CN и DisplayName'
+            } else {
+                'Отсутствует в выгрузке 1С'
+            }
+
         $DGroupsToDel.Add([PSCustomObject]@{
-            Mail = $Group.mail
-            DN   = $Group.DisplayName
+            Mail   = $Group.mail
+            DN     = $Group.DisplayName
+            Reason = $reason
         })
     }
     $DGroupsToDel | Export-Csv -Path $Csv_DGroupsToDel -Encoding UTF8 -NoTypeInformation
