@@ -89,7 +89,7 @@ function Get-ProtectedEmails {
             }
             Out-Log "[Information] Загружено $($map.Count) защищённых групп из $JsonPath."
         } catch {
-            Out-Log "[Error] Ошибка чтения $JsonPath: $($_.Exception.Message)"
+            Out-Log "[Error] Ошибка чтения ${JsonPath}: $($_.Exception.Message)"
         }
     } else {
         Out-Log "[Warning] protected_groups.json не найден: $JsonPath"
