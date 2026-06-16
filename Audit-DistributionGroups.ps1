@@ -12,6 +12,9 @@ $Csv_UserDepToAdd          = "D:\Scripts\DistributionGroups\UserDepToAdd.csv"
 $Csv_UsersToExclude        = "D:\Scripts\DistributionGroups\UsersToExclude.csv"
 $Csv_DGroupsToDel          = "D:\Scripts\DistributionGroups\DGroupsToDel.csv"
 
+# Защищённые группы (тот же файл, что и в скрипте синхронизации)
+$ProtectedGroupsJsonPath   = "D:\Scripts\Группы рассылки\protected_groups.json"
+
 # Параметры почты
 $MailServer    = "owa.transitcard.ru"
 $MailPort      = 25
@@ -72,6 +75,26 @@ Function Find-GroupMatch {
     if ([string]::IsNullOrWhiteSpace($SearchName)) { return $null }
     if ($Map.ContainsKey($SearchName)) { return $Map[$SearchName] }
     return $null
+}
+
+# ========== ЗАГРУЗКА ЗАЩИЩЁННЫХ ГРУПП (protected_groups.json) ==========
+function Get-ProtectedEmails {
+    param([string]$JsonPath)
+    $map = @{}
+    if (Test-Path $JsonPath) {
+        try {
+            $list = Get-Content -Path $JsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($entry in $list) {
+                if ($entry.email) { $map[$entry.email.ToLowerInvariant().Trim()] = $entry }
+            }
+            Out-Log "[Information] Загружено $($map.Count) защищённых групп из $JsonPath."
+        } catch {
+            Out-Log "[Error] Ошибка чтения $JsonPath: $($_.Exception.Message)"
+        }
+    } else {
+        Out-Log "[Warning] protected_groups.json не найден: $JsonPath"
+    }
+    return $map
 }
 
 # ========== УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ОТПРАВКИ ПИСЕМ ==========
@@ -427,7 +450,8 @@ function Find-UsersToExclude {
 function Find-ObsoleteGroups {
     param(
         $DGroups,
-        $AllNotes
+        $AllNotes,
+        $ProtectedByEmail
     )
     $DGroupsToDel = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -441,21 +465,30 @@ function Find-ObsoleteGroups {
     foreach ($Group in $DGroups) {
         $cn = if ($Group.CN)          { $Group.CN.Trim() }          else { '' }
         $dn = if ($Group.DisplayName) { $Group.DisplayName.Trim() } else { '' }
+
         # Группа актуальна, если её имя (CN или DisplayName) есть среди подразделений 1С.
         if ($currentDepNames.ContainsKey($cn) -or $currentDepNames.ContainsKey($dn)) { continue }
 
-        # Причина удаления.
+        # Те же условия, что и на Шаге 4 скрипта синхронизации: удаляется только пустая
+        # группа, которой нет в 1С и которая не защищена в protected_groups.json.
+        $memberCount = if ($Group.Members) { $Group.Members.Count } else { 0 }
+        $email       = if ($Group.mail) { $Group.mail.ToLowerInvariant().Trim() } else { $null }
+        $isProtected = $email -and $ProtectedByEmail.ContainsKey($email)
+
         $reason =
-            if ([string]::IsNullOrWhiteSpace($cn) -and [string]::IsNullOrWhiteSpace($dn)) {
-                'У группы пустые CN и DisplayName'
+            if ($memberCount -gt 0) {
+                "Отсутствует в 1С, но в группе есть пользователи ($memberCount) — синхронизация не удаляет непустые группы"
+            } elseif ($isProtected) {
+                'Пустая и отсутствует в 1С, но защищена в protected_groups.json — не удаляется'
             } else {
-                'Отсутствует в выгрузке 1С'
+                'Пустая и отсутствует в 1С — подлежит удалению'
             }
 
         $DGroupsToDel.Add([PSCustomObject]@{
-            Mail   = $Group.mail
-            DN     = $Group.DisplayName
-            Reason = $reason
+            Mail        = $Group.mail
+            DN          = $Group.DisplayName
+            MemberCount = $memberCount
+            Reason      = $reason
         })
     }
     $DGroupsToDel | Export-Csv -Path $Csv_DGroupsToDel -Encoding UTF8 -NoTypeInformation
@@ -531,8 +564,9 @@ try {
     $DGroups = $AllADGroups
     $UsersToExclude = Find-UsersToExclude -DGroups $DGroups -UserByDN $UserByDN
 
-    # 8. Устаревшие группы для удаления
-    $DGroupsToDel = Find-ObsoleteGroups -DGroups $DGroups -AllNotes $AllNotes
+    # 8. Устаревшие группы для удаления (с причиной по логике Шага 4 синхронизации)
+    $protectedByEmail = Get-ProtectedEmails -JsonPath $ProtectedGroupsJsonPath
+    $DGroupsToDel = Find-ObsoleteGroups -DGroups $DGroups -AllNotes $AllNotes -ProtectedByEmail $protectedByEmail
 
     # 9. Формирование сводной HTML-таблицы
     $SummaryTableHtml = Get-SummaryHtmlTable -NonCorrADGroup $NonCorrADGroup -NCMUpload $NCMUpload -NonCorrUserMembership $NonCorrUserMembership -UserDepToAdd $UserDepToAdd -UsersToExclude $UsersToExclude -DGroupsToDel $DGroupsToDel
