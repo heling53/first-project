@@ -322,7 +322,8 @@ Department -like '*'
         # и совпадают с атрибутом Department в AD.
         $key = Normalize-Name $g.Name
         if (-not $usersByDept.ContainsKey($key)) { continue }
-        $desired = @($usersByDept[$key])
+        # .ToArray() приводит List[object] к object[]: дальше работаем с обычным массивом.
+        $desired = $usersByDept[$key].ToArray()
         if ($desired.Count -eq 0) { continue }
         $desiredDNs = @($desired | ForEach-Object { $_.DistinguishedName })
         $toAdd = $desiredDNs | Where-Object { $_ -and ($g.Member -notcontains $_) }
@@ -445,7 +446,7 @@ Department -like '*'
         foreach ($g in $groupsForExcept) {
             $key = Normalize-Name $g.Name
             if (-not $exUsersByDept.ContainsKey($key)) { continue }
-            $desired = @($exUsersByDept[$key])
+            $desired = $exUsersByDept[$key].ToArray()
             if ($desired.Count -eq 0) { continue }
             $usersToAdd = @($desired | Where-Object { $_.DistinguishedName -and ($g.Member -notcontains $_.DistinguishedName) })
             if ($usersToAdd.Count -gt 0) {
