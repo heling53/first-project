@@ -133,12 +133,22 @@ function Get-StringSimilarity {
 }
 
 function Find-BestGroupMatch {
-    param([string]$SearchName, [hashtable]$GroupsMap, [double]$Threshold = 0.85)
+    param(
+        [string]$SearchName,
+        [hashtable]$GroupsMap,
+        [double]$Threshold = 0.85,
+        # Ключи, у которых есть собственное точное совпадение в целевом наборе.
+        # Такие ключи исключаются из нечёткого поиска, чтобы он не «перехватывал»
+        # элемент, который и так уже точно сопоставлен своей группе.
+        [hashtable]$ExactKeys = $null
+    )
     if ([string]::IsNullOrWhiteSpace($SearchName)) { return $null }
     $key = Normalize-Name $SearchName
     if ($GroupsMap.ContainsKey($key)) { return $GroupsMap[$key] }
     $best = $null; $bestScore = 0.0
     foreach ($k in $GroupsMap.Keys) {
+        # Нечёткое совпадение допустимо только если у ключа нет точного совпадения.
+        if ($ExactKeys -and $ExactKeys.ContainsKey($k)) { continue }
         $s = Get-StringSimilarity -String1 $key -String2 $k
         if ($s -ge $Threshold -and $s -gt $bestScore) {
             $bestScore = $s; $best = $GroupsMap[$k]
@@ -382,7 +392,10 @@ Department -like '*'
     foreach ($g in $managedGroups) {
         # Точное совпадение по имени подразделения, иначе нечёткое (порог $FuzzyMatchThreshold):
         # имена групп берутся из 1С и могут немного отличаться от атрибута Department в AD.
-        $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $usersByDept -Threshold $FuzzyMatchThreshold
+        # ExactKeys = $managedGroupsMap: если у отдела есть собственная точная группа,
+        # его пользователи не должны нечётко «утекать» в другую похожую группу
+        # (например, "...КЦ" и "...ПМ" не перемешиваются).
+        $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $usersByDept -Threshold $FuzzyMatchThreshold -ExactKeys $managedGroupsMap
         if (-not $desired -or @($desired).Count -eq 0) { continue }
         $desiredDNs = @($desired | ForEach-Object { $_.DistinguishedName })
         $toAdd = $desiredDNs | Where-Object { $_ -and ($g.Member -notcontains $_) }
