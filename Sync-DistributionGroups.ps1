@@ -322,8 +322,8 @@ Department -like '*'
         # и совпадают с атрибутом Department в AD.
         $key = Normalize-Name $g.Name
         if (-not $usersByDept.ContainsKey($key)) { continue }
-        $desired = $usersByDept[$key]
-        if (-not $desired -or @($desired).Count -eq 0) { continue }
+        $desired = @($usersByDept[$key])
+        if ($desired.Count -eq 0) { continue }
         $desiredDNs = @($desired | ForEach-Object { $_.DistinguishedName })
         $toAdd = $desiredDNs | Where-Object { $_ -and ($g.Member -notcontains $_) }
         if ($toAdd.Count -gt 0) {
@@ -445,8 +445,8 @@ Department -like '*'
         foreach ($g in $groupsForExcept) {
             $key = Normalize-Name $g.Name
             if (-not $exUsersByDept.ContainsKey($key)) { continue }
-            $desired = $exUsersByDept[$key]
-            if (-not $desired -or @($desired).Count -eq 0) { continue }
+            $desired = @($exUsersByDept[$key])
+            if ($desired.Count -eq 0) { continue }
             $usersToAdd = @($desired | Where-Object { $_.DistinguishedName -and ($g.Member -notcontains $_.DistinguishedName) })
             if ($usersToAdd.Count -gt 0) {
                 if ($PSCmdlet.ShouldProcess($g.Name, "Add $($usersToAdd.Count) users без EmployeeNumber")) {
