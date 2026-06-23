@@ -9,10 +9,9 @@
     Из него берутся:
       - уникальные подразделения  — для создания групп рассылки (колонки objFullName/objName);
       - иерархия (parent/child)    — для вложенности групп (objName -> objFullName);
-      - руководители подразделений — колонка «Руководитель подразделения» (табельный номер);
-      - orgUnitId                  — для аудита переименований (extensionAttribute1).
+      - руководители подразделений — колонка «Руководитель подразделения» (табельный номер).
     Дополнительно:
-      - protected_groups.json — защита от удаления + аудит переименований.
+      - protected_groups.json — защита от удаления.
     Пользователи берутся из AD и распределяются по группам по названию подразделения.
 .NOTES
     Все операции выполняются на одном DC ($DcServer), read-after-write согласован.
@@ -25,10 +24,8 @@ param(
     [string]$MailDomain              = 'transitcard.ru',
     [string]$ExchangeServer          = 'srv-ex16-01.transitcard.ru',
     [string]$DcServer                = 'srv-dc3.transitcard.ru',
-    [double]$FuzzyMatchThreshold     = 0.85,
     [string]$ProtectedGroupsJsonPath = 'D:\Scripts\Группы рассылки\protected_groups.json',
     [string]$ExcelPath               = 'D:\Scripts\verify1C\1c\Подразделения.xlsx',
-    [string]$ReportCsvPath           = 'D:\Scripts\Группы рассылки\RenameReport.csv',
     [string]$LogPath                 = 'D:\Scripts\Группы рассылки\Logs',
     [int]$SamMaxLength               = 20,
     [string]$UsersCorpOU             = 'OU=Users.Corp,DC=transitcard,DC=ru'
@@ -100,63 +97,6 @@ function Normalize-Name {
     return ($Text -replace '\s+', ' ').Trim().ToLowerInvariant()
 }
 
-# ==========================================
-# Левенштейн с ранним отсечением
-# ==========================================
-function Get-StringSimilarity {
-    param([string]$String1, [string]$String2)
-    if ([string]::IsNullOrEmpty($String1) -and [string]::IsNullOrEmpty($String2)) { return 1.0 }
-    if ([string]::IsNullOrEmpty($String1) -or  [string]::IsNullOrEmpty($String2)) { return 0.0 }
-    $s1 = Normalize-Name $String1
-    $s2 = Normalize-Name $String2
-    $len1 = $s1.Length; $len2 = $s2.Length
-    $maxLen = [Math]::Max($len1, $len2)
-    if ($maxLen -eq 0) { return 1.0 }
-    # Раннее отсечение по длине
-    if ([Math]::Abs($len1 - $len2) / [double]$maxLen -gt 0.5) { return 0.0 }
-
-    $prev = 0..$len2
-    $curr = New-Object int[] ($len2 + 1)
-    for ($i = 1; $i -le $len1; $i++) {
-        $curr[0] = $i
-        $c1 = $s1[$i - 1]
-        for ($j = 1; $j -le $len2; $j++) {
-            $cost = if ($c1 -eq $s2[$j - 1]) { 0 } else { 1 }
-            $min  = $curr[$j - 1] + 1
-            if ($prev[$j] + 1 -lt $min)         { $min = $prev[$j] + 1 }
-            if ($prev[$j - 1] + $cost -lt $min) { $min = $prev[$j - 1] + $cost }
-            $curr[$j] = $min
-        }
-        $tmp = $prev; $prev = $curr; $curr = $tmp
-    }
-    return 1 - ($prev[$len2] / $maxLen)
-}
-
-function Find-BestGroupMatch {
-    param(
-        [string]$SearchName,
-        [hashtable]$GroupsMap,
-        [double]$Threshold = 0.85,
-        # Ключи, у которых есть собственное точное совпадение в целевом наборе.
-        # Такие ключи исключаются из нечёткого поиска, чтобы он не «перехватывал»
-        # элемент, который и так уже точно сопоставлен своей группе.
-        [hashtable]$ExactKeys = $null
-    )
-    if ([string]::IsNullOrWhiteSpace($SearchName)) { return $null }
-    $key = Normalize-Name $SearchName
-    if ($GroupsMap.ContainsKey($key)) { return $GroupsMap[$key] }
-    $best = $null; $bestScore = 0.0
-    foreach ($k in $GroupsMap.Keys) {
-        # Нечёткое совпадение допустимо только если у ключа нет точного совпадения.
-        if ($ExactKeys -and $ExactKeys.ContainsKey($k)) { continue }
-        $s = Get-StringSimilarity -String1 $key -String2 $k
-        if ($s -ge $Threshold -and $s -gt $bestScore) {
-            $bestScore = $s; $best = $GroupsMap[$k]
-        }
-    }
-    return $best
-}
-
 function Get-UniqueSamAccountName {
     param([string]$BaseName, [hashtable]$Used, [int]$MaxLen = 20)
     $base = $BaseName
@@ -218,7 +158,6 @@ try {
     }
     Import-Module ImportExcel
 
-    $excelDeptById  = @{}
     $excelHierarchy = New-Object System.Collections.Generic.List[object]
     $excelManagers  = New-Object System.Collections.Generic.List[object]
     $departmentList = New-Object System.Collections.Generic.List[string]
@@ -230,9 +169,6 @@ try {
         $parentName = if ($row.objName)     { ($row.objName.ToString()     -replace '\s+', ' ').Trim() } else { $null }
         $managerEN  = if ($row.'Руководитель подразделения') { ($row.'Руководитель подразделения'.ToString().Trim() -replace '^0+', '') } else { $null }
 
-        if ($row.orgUnitId -and $childName) {
-            $excelDeptById[$row.orgUnitId.ToString().Trim()] = $childName
-        }
         if ($childName -and $parentName -and ($childName -ne $parentName)) {
             $excelHierarchy.Add([PSCustomObject]@{ Child = $childName; Parent = $parentName })
         }
@@ -262,12 +198,11 @@ try {
     }
 
     # Набор имён групп, которые ДОЛЖНЫ существовать по справочнику 1С.
-    # Ключи нормализованы и обрезаны до 64 символов — так же, как имена создаваемых групп,
+    # Ключи нормализованы — так же, как имена создаваемых групп,
     # чтобы Шаг 4 не удалял пустые группы, реально присутствующие в 1С.
     $excelGroupKeys = @{}
     foreach ($d in $departments) {
-        $gn = if ($d.Length -gt 64) { $d.Substring(0, 64) } else { $d }
-        $excelGroupKeys[(Normalize-Name $gn)] = $true
+        $excelGroupKeys[(Normalize-Name $d)] = $true
     }
 
     # ==========================================
@@ -278,7 +213,7 @@ try {
     # Один запрос: все управляемые группы в OU
     $existingGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
                                   -SearchBase $TargetOU -Server $DcServer `
-                                  -Properties Name, SamAccountName, mail, DisplayName, extensionAttribute1, Member
+                                  -Properties Name, SamAccountName, mail, DisplayName, Member
     $groupsByName = @{}
     $usedSam      = @{}
     foreach ($g in $existingGroups) {
@@ -287,14 +222,7 @@ try {
     }
 
     foreach ($dept in $departments) {
-        # Имя группы (AD ограничивает CN 64 символами) определяем до проверки наличия,
-        # чтобы длинные имена не пытались пересоздаваться на каждом запуске.
         $groupName = $dept
-        if ($groupName.Length -gt 64) {
-            $groupName = $groupName.Substring(0, 64)
-            Write-Log "Имя группы обрезано до 64 символов: '$groupName'" 'WARN'
-        }
-
         if ($groupsByName.ContainsKey($groupName)) { continue }
 
         $latin = Convert-CyrillicToLatin -Text (Get-Initials -Text $dept)
@@ -349,7 +277,7 @@ try {
     # Перечитываем актуальный список (группы пусты)
     $managedGroups = Get-ADGroup -LDAPFilter "(description=$GroupDesc)" `
                                  -SearchBase $TargetOU -Server $DcServer `
-                                 -Properties Member, mail, DisplayName, extensionAttribute1
+                                 -Properties Member, mail
     $managedGroupsMap = @{}
     foreach ($g in $managedGroups) {
         $managedGroupsMap[(Normalize-Name $g.Name)] = $g
@@ -390,13 +318,13 @@ Department -like '*'
     }
 
     foreach ($g in $managedGroups) {
-        # Точное совпадение по имени подразделения, иначе нечёткое (порог $FuzzyMatchThreshold):
-        # имена групп берутся из 1С и могут немного отличаться от атрибута Department в AD.
-        # ExactKeys = $managedGroupsMap: если у отдела есть собственная точная группа,
-        # его пользователи не должны нечётко «утекать» в другую похожую группу
-        # (например, "...КЦ" и "...ПМ" не перемешиваются).
-        $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $usersByDept -Threshold $FuzzyMatchThreshold -ExactKeys $managedGroupsMap
-        if (-not $desired -or @($desired).Count -eq 0) { continue }
+        # Точное совпадение по имени подразделения: имена групп берутся из 1С
+        # и совпадают с атрибутом Department в AD.
+        $key = Normalize-Name $g.Name
+        if (-not $usersByDept.ContainsKey($key)) { continue }
+        # .ToArray() приводит List[object] к object[]: дальше работаем с обычным массивом.
+        $desired = $usersByDept[$key].ToArray()
+        if ($desired.Count -eq 0) { continue }
         $desiredDNs = @($desired | ForEach-Object { $_.DistinguishedName })
         $toAdd = $desiredDNs | Where-Object { $_ -and ($g.Member -notcontains $_) }
         if ($toAdd.Count -gt 0) {
@@ -419,11 +347,12 @@ Department -like '*'
             continue
         }
         $manager = $usersByEmpNum[$m.EmployeeNumber]
-        $group = Find-BestGroupMatch -SearchName $m.Department -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
-        if (-not $group) {
+        $deptKey = Normalize-Name $m.Department
+        if (-not $managedGroupsMap.ContainsKey($deptKey)) {
             Write-Log "Группа подразделения '$($m.Department)' не найдена" 'WARN'
             continue
         }
+        $group = $managedGroupsMap[$deptKey]
         if ($PSCmdlet.ShouldProcess($group.Name, "Add manager $($manager.SamAccountName)")) {
             try {
                 Add-ADGroupMember -Identity $group -Members $manager.DistinguishedName -Server $DcServer -ErrorAction Stop
@@ -447,12 +376,14 @@ Department -like '*'
     # ==========================================
     # ШАГ 3. Иерархия из 1С (Excel)
     # ==========================================
-    Write-Log "Шаг 3: иерархия (порог $FuzzyMatchThreshold)" 'STEP'
+    Write-Log "Шаг 3: иерархия" 'STEP'
     foreach ($row in $excelHierarchy) {
-        $parent = Find-BestGroupMatch -SearchName $row.Parent -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
-        $child  = Find-BestGroupMatch -SearchName $row.Child  -GroupsMap $managedGroupsMap -Threshold $FuzzyMatchThreshold
-        if (-not $parent) { Write-Log "Родитель '$($row.Parent)' не найден" 'WARN'; continue }
-        if (-not $child)  { Write-Log "Потомок '$($row.Child)' не найден"  'WARN'; continue }
+        $parentKey = Normalize-Name $row.Parent
+        $childKey  = Normalize-Name $row.Child
+        if (-not $managedGroupsMap.ContainsKey($parentKey)) { Write-Log "Родитель '$($row.Parent)' не найден" 'WARN'; continue }
+        if (-not $managedGroupsMap.ContainsKey($childKey))  { Write-Log "Потомок '$($row.Child)' не найден"  'WARN'; continue }
+        $parent = $managedGroupsMap[$parentKey]
+        $child  = $managedGroupsMap[$childKey]
         try {
             if ($PSCmdlet.ShouldProcess("$($child.Name) -> $($parent.Name)", "Add child group")) {
                 Add-ADGroupMember -Identity $parent -Members $child -Server $DcServer -ErrorAction Stop
@@ -463,39 +394,6 @@ Department -like '*'
                 Write-Log "Иерархия fail: $($_.Exception.Message)" 'ERROR'
             }
         }
-    }
-
-    # ==========================================
-    # ШАГ 3.1. Аудит переименований из 1С
-    # ==========================================
-    Write-Log "Шаг 3.1: аудит переименований" 'STEP'
-    $report = New-Object System.Collections.Generic.List[object]
-    foreach ($g in $managedGroups) {
-        $email = if ($g.mail) { $g.mail.ToLowerInvariant().Trim() } else { $null }
-        if (-not ($email -and $protectedByEmail.ContainsKey($email))) { continue }
-
-        $currentDisplay = if ($g.DisplayName) { $g.DisplayName.Trim() } else { '' }
-        $attrId = if ($g.extensionAttribute1) { $g.extensionAttribute1.Trim() } else { $null }
-        $excelName = ''
-        $status =
-            if (-not $attrId) { 'Нет ID в extensionAttribute1' }
-            elseif (-not $excelDeptById.ContainsKey($attrId)) { 'ID не найден в 1С' }
-            else {
-                $excelName = $excelDeptById[$attrId]
-                if ($currentDisplay -ne $excelName) { 'Требуется переименование' }
-                else { 'Имя актуально' }
-            }
-        $report.Add([PSCustomObject]@{
-            Email        = $g.mail
-            CurrentName  = $currentDisplay
-            DepartmentId = $attrId
-            NameIn1C     = $excelName
-            Status       = $status
-        })
-    }
-    if ($report.Count -gt 0) {
-        $report | Export-Csv -Path $ReportCsvPath -NoTypeInformation -Encoding UTF8
-        Write-Log "Отчёт: $ReportCsvPath ($($report.Count) записей)" 'OK'
     }
 
     # ==========================================
@@ -546,8 +444,10 @@ Department -like '*'
                                        -SearchBase $TargetOU -Server $DcServer `
                                        -Properties Member
         foreach ($g in $groupsForExcept) {
-            $desired = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $exUsersByDept -Threshold $FuzzyMatchThreshold
-            if (-not $desired -or @($desired).Count -eq 0) { continue }
+            $key = Normalize-Name $g.Name
+            if (-not $exUsersByDept.ContainsKey($key)) { continue }
+            $desired = $exUsersByDept[$key].ToArray()
+            if ($desired.Count -eq 0) { continue }
             $usersToAdd = @($desired | Where-Object { $_.DistinguishedName -and ($g.Member -notcontains $_.DistinguishedName) })
             if ($usersToAdd.Count -gt 0) {
                 if ($PSCmdlet.ShouldProcess($g.Name, "Add $($usersToAdd.Count) users без EmployeeNumber")) {
@@ -575,9 +475,8 @@ Department -like '*'
         if ($g.Member -and $g.Member.Count -gt 0) { continue }
 
         # 2) Не удаляем, если подразделение есть в справочнике 1С (даже если группа сейчас пуста,
-        #    например новый отдел без сотрудников). Сверка с тем же нечётким порогом.
-        $inExcel = Find-BestGroupMatch -SearchName $g.Name -GroupsMap $excelGroupKeys -Threshold $FuzzyMatchThreshold
-        if ($inExcel) {
+        #    например новый отдел без сотрудников). Точная сверка по нормализованному имени.
+        if ($excelGroupKeys.ContainsKey((Normalize-Name $g.Name))) {
             Write-Log "Есть в 1С, пропуск удаления пустой группы: $($g.Name)" 'WARN'
             continue
         }

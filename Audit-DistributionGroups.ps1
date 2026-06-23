@@ -11,8 +11,9 @@ $Csv_NonCorrUserMembership = "D:\Scripts\DistributionGroups\NonCorrUserMembershi
 $Csv_UserDepToAdd          = "D:\Scripts\DistributionGroups\UserDepToAdd.csv"
 $Csv_UsersToExclude        = "D:\Scripts\DistributionGroups\UsersToExclude.csv"
 $Csv_DGroupsToDel          = "D:\Scripts\DistributionGroups\DGroupsToDel.csv"
-$Csv_DGroupsToRename       = "D:\Scripts\DistributionGroups\DGroupsToRename.csv"
-$Csv_ImportedDeps          = "D:\Scripts\DistributionGroups\ImportedDeps.csv"
+
+# Защищённые группы (тот же файл, что и в скрипте синхронизации)
+$ProtectedGroupsJsonPath   = "D:\Scripts\Группы рассылки\protected_groups.json"
 
 # Параметры почты
 $MailServer    = "owa.transitcard.ru"
@@ -20,9 +21,6 @@ $MailPort      = 25
 $MailSender    = "infosec-notifications@pprcard.ru"
 $MailRecipient = @("itsecurity@pprcard.ru")
 $MailSubject   = "[Группы рассылки] Менеджмент групп рассылки подразделений"
-
-# Порог нечёткого сравнения (в процентах)
-$FuzzyThreshold = 85
 
 # ========== ПРОВЕРКА ПОВТОРНОГО ЗАПУСКА ==========
 $mutex = New-Object System.Threading.Mutex($false, "Global\DistributionGroupsScript")
@@ -70,80 +68,33 @@ try {
     exit 1
 }
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (СХОДСТВО СТРОК) ==========
-Function Get-StringSimilarity {
-    Param([string]$str1, [string]$str2)
-
-    if ($str1 -eq $str2) { return 100 }
-    if ([string]::IsNullOrWhiteSpace($str1) -or [string]::IsNullOrWhiteSpace($str2)) { return 0 }
-
-    $s1 = $str1.ToLower().Trim()
-    $s2 = $str2.ToLower().Trim()
-
-    $len1 = $s1.Length
-    $len2 = $s2.Length
-    $matrix = New-Object 'int[,]' ($len1 + 1), ($len2 + 1)
-
-    for ($i = 0; $i -le $len1; $i++) { $matrix[$i, 0] = $i }
-    for ($j = 0; $j -le $len2; $j++) { $matrix[0, $j] = $j }
-
-    for ($i = 1; $i -le $len1; $i++) {
-        for ($j = 1; $j -le $len2; $j++) {
-            $cost = if ($s1[$i - 1] -eq $s2[$j - 1]) { 0 } else { 1 }
-
-            $deletion    = $matrix[($i - 1), $j] + 1
-            $insertion   = $matrix[$i, ($j - 1)] + 1
-            $substitution = $matrix[($i - 1), ($j - 1)] + $cost
-
-            $minVal = [math]::Min($deletion, $insertion)
-            $matrix[$i, $j] = [math]::Min($minVal, $substitution)
-        }
-    }
-
-    $dist = $matrix[$len1, $len2]
-    $maxL = [math]::Max($len1, $len2)
-    return [math]::Round(((1 - ($dist / $maxL)) * 100), 2)
-}
-
-Function Find-BestGroupMatch {
+# ========== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ (ТОЧНЫЙ ПОИСК ГРУППЫ) ==========
+Function Find-GroupMatch {
     Param([string]$SearchName, [hashtable]$Map)
 
     if ([string]::IsNullOrWhiteSpace($SearchName)) { return $null }
     if ($Map.ContainsKey($SearchName)) { return $Map[$SearchName] }
-
-    $bestMatch = $null
-    $highestScore = 0
-
-    foreach ($key in $Map.Keys) {
-        $score = Get-StringSimilarity -str1 $SearchName -str2 $key
-        if ($score -ge $FuzzyThreshold -and $score -gt $highestScore) {
-            $highestScore = $score
-            $bestMatch = $Map[$key]
-        }
-    }
-    return $bestMatch
+    return $null
 }
 
-# ========== ПРОВЕРКА ЭКВИВАЛЕНТНОСТИ ИМЁН ГРУПП (УЧЁТ ОБРЕЗАНИЯ AD) ==========
-function Test-GroupNameEquivalence {
-    param(
-        [string]$Name1,
-        [string]$Name2
-    )
-    if ($Name1 -eq $Name2) { return $true }
-
-    $len1 = $Name1.Length
-    $len2 = $Name2.Length
-    if ($len1 -gt 0 -and $len2 -gt 0) {
-        $minLen = [Math]::Min($len1, $len2)
-        $prefix = $Name1.Substring(0, $minLen)
-        if ($Name2.StartsWith($prefix) -and [Math]::Abs($len1 - $len2) -le 5) {
-            return $true
+# ========== ЗАГРУЗКА ЗАЩИЩЁННЫХ ГРУПП (protected_groups.json) ==========
+function Get-ProtectedEmails {
+    param([string]$JsonPath)
+    $map = @{}
+    if (Test-Path $JsonPath) {
+        try {
+            $list = Get-Content -Path $JsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($entry in $list) {
+                if ($entry.email) { $map[$entry.email.ToLowerInvariant().Trim()] = $entry }
+            }
+            Out-Log "[Information] Загружено $($map.Count) защищённых групп из $JsonPath."
+        } catch {
+            Out-Log "[Error] Ошибка чтения ${JsonPath}: $($_.Exception.Message)"
         }
+    } else {
+        Out-Log "[Warning] protected_groups.json не найден: $JsonPath"
     }
-
-    $similarity = Get-StringSimilarity -str1 $Name1 -str2 $Name2
-    return ($similarity -ge 95)
+    return $map
 }
 
 # ========== УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ОТПРАВКИ ПИСЕМ ==========
@@ -314,7 +265,7 @@ function Find-NonCorrADGroup {
         $depName = $Department."Полное наименование пдоразделения"
         if ($depName -match '^obj') { continue }
 
-        $foundGroup = Find-BestGroupMatch -SearchName $depName -Map $GroupByDisplayName
+        $foundGroup = Find-GroupMatch -SearchName $depName -Map $GroupByDisplayName
         if (-not $foundGroup) {
             $adGroup = Get-ADGroup -Filter "DisplayName -eq '$depName'" -Properties Description -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($adGroup) {
@@ -327,7 +278,7 @@ function Find-NonCorrADGroup {
                 $NonCorrADGroup.Add([PSCustomObject]@{
                     DisplayName = $depName
                     Description = "Группа рассылки подразделения_v1.0"
-                    Reason      = "Группа с таким DN не найдена (Порог $FuzzyThreshold%)"
+                    Reason      = "Группа с таким DN не найдена"
                 })
             }
         }
@@ -336,7 +287,7 @@ function Find-NonCorrADGroup {
     return $NonCorrADGroup
 }
 
-# ========== ФУНКЦИЯ ПРОВЕРКИ ИЕРАРХИИ (С УЧЁТОМ ОБРЕЗАНИЯ ИМЁН) ==========
+# ========== ФУНКЦИЯ ПРОВЕРКИ ИЕРАРХИИ ==========
 function Test-GroupHierarchy {
     param(
         $AllNotes,
@@ -350,15 +301,15 @@ function Test-GroupHierarchy {
         if ($CurrDep -eq "Руководство") { continue }
         if ([string]::IsNullOrWhiteSpace($HeadDep)) { continue }
 
-        $targetGroup = Find-BestGroupMatch -SearchName $CurrDep -Map $GroupByDisplayName
-        $parentGroup = Find-BestGroupMatch -SearchName $HeadDep -Map $GroupByDisplayName
+        $targetGroup = Find-GroupMatch -SearchName $CurrDep -Map $GroupByDisplayName
+        $parentGroup = Find-GroupMatch -SearchName $HeadDep -Map $GroupByDisplayName
         if (-not $targetGroup -or -not $parentGroup) { continue }
 
         $isMember = $false
         foreach ($memberOfDN in $targetGroup.MemberOf) {
             $parentCandidate = $GroupByDistName[$memberOfDN]
             if ($parentCandidate -and $parentCandidate.Description -eq "Группа рассылки подразделения_v1.0") {
-                if (Test-GroupNameEquivalence -Name1 $parentCandidate.DisplayName -Name2 $HeadDep) {
+                if ($parentCandidate.DisplayName -eq $HeadDep) {
                     $isMember = $true
                     break
                 }
@@ -370,7 +321,7 @@ function Test-GroupHierarchy {
             foreach ($dn in $targetGroup.MemberOf) {
                 $parent = $GroupByDistName[$dn]
                 if ($parent -and $parent.Description -eq "Группа рассылки подразделения_v1.0") {
-                    if (-not (Test-GroupNameEquivalence -Name1 $parent.DisplayName -Name2 $HeadDep)) {
+                    if ($parent.DisplayName -ne $HeadDep) {
                         $groupsToExclude += $parent.DisplayName
                     }
                 }
@@ -418,7 +369,7 @@ function Find-NonCorrUserMembership {
     $NonCorrUserMembership = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($Department in $AllNotes) {
         $depName = $Department.'Полное наименование пдоразделения'
-        $group = Find-BestGroupMatch -SearchName $depName -Map $GroupByDisplayName
+        $group = Find-GroupMatch -SearchName $depName -Map $GroupByDisplayName
         if (-not $group) { continue }
 
         $managerEN = $managersByDept[$depName]
@@ -436,7 +387,8 @@ function Find-NonCorrUserMembership {
                 continue
             }
 
-            if ((Get-StringSimilarity -str1 $user.Department -str2 $depName) -lt $FuzzyThreshold) {
+            $userDep = if ($user.Department) { $user.Department.Trim() } else { '' }
+            if ($userDep -ne $depName) {
                 $NonCorrUserMembership.Add([PSCustomObject]@{
                     SamAccountName  = $user.SamAccountName
                     DeleteFromGroup = $depName
@@ -457,7 +409,7 @@ function Find-UsersToAdd {
     )
     $UserDepToAdd = [System.Collections.Generic.List[PSObject]]::new()
     foreach ($User in $AllADUsers) {
-        $group = Find-BestGroupMatch -SearchName $User.Department -Map $GroupByCN
+        $group = Find-GroupMatch -SearchName $User.Department -Map $GroupByCN
         if (-not $group) { continue }
         $isMember = $group.Members -contains $User.DistinguishedName
         if (-not $isMember) {
@@ -494,67 +446,53 @@ function Find-UsersToExclude {
     return $UsersToExclude
 }
 
-# ========== ФУНКЦИЯ ПОИСКА УСТАРЕВШИХ ГРУПП ДЛЯ УДАЛЕНИЯ / ПЕРЕИМЕНОВАНИЯ ==========
+# ========== ФУНКЦИЯ ПОИСКА УСТАРЕВШИХ ГРУПП ДЛЯ УДАЛЕНИЯ ==========
 function Find-ObsoleteGroups {
     param(
         $DGroups,
         $AllNotes,
-        $ImportedDeps
+        $ProtectedByEmail
     )
     $DGroupsToDel = [System.Collections.Generic.List[PSObject]]::new()
-    $DGroupsToRename = [System.Collections.Generic.List[PSObject]]::new()
 
-    $currentDepNames = $AllNotes.'Полное наименование пдоразделения'
-    $currentDepByDisplayName = @{}
+    # Актуальные имена подразделений из 1С (точное сопоставление по имени).
+    $currentDepNames = @{}
     foreach ($dep in $AllNotes) {
-        $currentDepByDisplayName[$dep.'Полное наименование пдоразделения'] = $dep
+        $n = $dep.'Полное наименование пдоразделения'
+        if ($n) { $currentDepNames[$n.Trim()] = $true }
     }
 
     foreach ($Group in $DGroups) {
-        $existsNow = $false
-        foreach ($name in $currentDepNames) {
-            if ((Get-StringSimilarity -str1 $Group.CN -str2 $name) -ge $FuzzyThreshold) {
-                $existsNow = $true
-                break
-            }
-        }
+        $cn = if ($Group.CN)          { $Group.CN.Trim() }          else { '' }
+        $dn = if ($Group.DisplayName) { $Group.DisplayName.Trim() } else { '' }
 
-        if (-not $existsNow) {
-            $foundCurrent = $false
-            foreach ($key in $currentDepByDisplayName.Keys) {
-                if ((Get-StringSimilarity -str1 $Group.DisplayName -str2 $key) -ge $FuzzyThreshold) {
-                    $foundCurrent = $true
-                    break
-                }
-            }
-            if ($foundCurrent) {
-                continue
+        # Группа актуальна, если её имя (CN или DisplayName) есть среди подразделений 1С.
+        if ($currentDepNames.ContainsKey($cn) -or $currentDepNames.ContainsKey($dn)) { continue }
+
+        # Те же условия, что и на Шаге 4 скрипта синхронизации: удаляется только пустая
+        # группа, которой нет в 1С и которая не защищена в protected_groups.json.
+        $memberCount = if ($Group.Members) { $Group.Members.Count } else { 0 }
+        $email       = if ($Group.mail) { $Group.mail.ToLowerInvariant().Trim() } else { $null }
+        $isProtected = $email -and $ProtectedByEmail.ContainsKey($email)
+
+        $reason =
+            if ($memberCount -gt 0) {
+                "Отсутствует в 1С, но в группе есть пользователи ($memberCount) — синхронизация не удаляет непустые группы"
+            } elseif ($isProtected) {
+                'Пустая и отсутствует в 1С, но защищена в protected_groups.json — не удаляется'
+            } else {
+                'Пустая и отсутствует в 1С — подлежит удалению'
             }
 
-            $oldDep = $ImportedDeps | Where-Object { (Get-StringSimilarity -str1 $_.'Полное наименование пдоразделения' -str2 $Group.CN) -ge $FuzzyThreshold } | Select-Object -First 1
-            if ($oldDep) {
-                $newDep = $AllNotes | Where-Object { $_.'Уникальный идентификатор подразделения' -eq $oldDep.'Уникальный идентификатор подразделения' } | Select-Object -First 1
-                if ($newDep -and ($newDep.'Полное наименование пдоразделения' -ne $oldDep.'Полное наименование пдоразделения')) {
-                    $DGroupsToRename.Add([PSCustomObject]@{
-                        Mail        = $Group.mail
-                        OldDepName  = $oldDep.'Полное наименование пдоразделения'
-                        NewDepName  = $newDep.'Полное наименование пдоразделения'
-                    })
-                } elseif (-not $newDep) {
-                    $DGroupsToDel.Add([PSCustomObject]@{
-                        Mail = $Group.mail
-                        DN   = $Group.DisplayName
-                    })
-                }
-            }
-        }
+        $DGroupsToDel.Add([PSCustomObject]@{
+            Mail        = $Group.mail
+            DN          = $Group.DisplayName
+            MemberCount = $memberCount
+            Reason      = $reason
+        })
     }
-    $DGroupsToDel    | Export-Csv -Path $Csv_DGroupsToDel -Encoding UTF8 -NoTypeInformation
-    $DGroupsToRename | Export-Csv -Path $Csv_DGroupsToRename -Encoding UTF8 -NoTypeInformation
-    return @{
-        ToDel    = $DGroupsToDel
-        ToRename = $DGroupsToRename
-    }
+    $DGroupsToDel | Export-Csv -Path $Csv_DGroupsToDel -Encoding UTF8 -NoTypeInformation
+    return $DGroupsToDel
 }
 
 # ========== ФУНКЦИЯ ФОРМИРОВАНИЯ HTML-ТАБЛИЦЫ СВОДКИ ==========
@@ -574,8 +512,7 @@ function Get-SummaryHtmlTable {
         $NonCorrUserMembership,
         $UserDepToAdd,
         $UsersToExclude,
-        $DGroupsToDel,
-        $DGroupsToRename
+        $DGroupsToDel
     )
     $rows = @(
         @{ Файл = "NonCorrADGroup.csv";         Описание = "Некорректно добавленные или несуществующие группы рассылки подразделений";          Записей = (Get-RecordCount $NonCorrADGroup) },
@@ -583,8 +520,7 @@ function Get-SummaryHtmlTable {
         @{ Файл = "NonCorrUserMembership.csv";  Описание = "Записи о некорректном вхождении пользователя в группу рассылки";                      Записей = (Get-RecordCount $NonCorrUserMembership) },
         @{ Файл = "UserDepToAdd.csv";           Описание = "Записи для включения пользователей в группы рассылки";                                Записей = (Get-RecordCount $UserDepToAdd) },
         @{ Файл = "UsersToExclude.csv";         Описание = "Записи о деактивированных пользователях, подлежащих исключению из группы";            Записей = (Get-RecordCount $UsersToExclude) },
-        @{ Файл = "DGroupsToDel.csv";           Описание = "Список групп рассылки, подлежащих удалению";                                          Записей = (Get-RecordCount $DGroupsToDel) },
-        @{ Файл = "DGroupsToRename.csv";        Описание = "Группы, требующие переименования";                                                    Записей = (Get-RecordCount $DGroupsToRename) }
+        @{ Файл = "DGroupsToDel.csv";           Описание = "Список групп рассылки, подлежащих удалению";                                          Записей = (Get-RecordCount $DGroupsToDel) }
     )
     $html = "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse;'>"
     $html += "<tr><th>Файл</th><th>Описание</th><th>Количество записей</th></tr>"
@@ -615,7 +551,7 @@ try {
     # 3. Некорректные группы рассылки
     $NonCorrADGroup = Find-NonCorrADGroup -AllNotes $AllNotes -GroupByDisplayName $GroupByDisplayName
 
-    # 4. Проверка иерархии (с учётом обрезки имён)
+    # 4. Проверка иерархии
     $NCMUpload = Test-GroupHierarchy -AllNotes $AllNotes -GroupByDisplayName $GroupByDisplayName -GroupByDistName $GroupByDistName
 
     # 5. Некорректные члены (пользователи) — с учётом руководителей нескольких подразделений
@@ -628,19 +564,14 @@ try {
     $DGroups = $AllADGroups
     $UsersToExclude = Find-UsersToExclude -DGroups $DGroups -UserByDN $UserByDN
 
-    # 8. Устаревшие группы для удаления/переименования
-    $ImportedDeps = if (Test-Path $Csv_ImportedDeps) { Import-Csv $Csv_ImportedDeps -Encoding UTF8 } else { @() }
-    $ObsoleteGroups = Find-ObsoleteGroups -DGroups $DGroups -AllNotes $AllNotes -ImportedDeps $ImportedDeps
-    $DGroupsToDel    = $ObsoleteGroups.ToDel
-    $DGroupsToRename = $ObsoleteGroups.ToRename
+    # 8. Устаревшие группы для удаления (с причиной по логике Шага 4 синхронизации)
+    $protectedByEmail = Get-ProtectedEmails -JsonPath $ProtectedGroupsJsonPath
+    $DGroupsToDel = Find-ObsoleteGroups -DGroups $DGroups -AllNotes $AllNotes -ProtectedByEmail $protectedByEmail
 
-    # 9. Сохранение текущего состояния подразделений
-    $AllNotes | Export-Csv -Path $Csv_ImportedDeps -Encoding UTF8 -NoTypeInformation
+    # 9. Формирование сводной HTML-таблицы
+    $SummaryTableHtml = Get-SummaryHtmlTable -NonCorrADGroup $NonCorrADGroup -NCMUpload $NCMUpload -NonCorrUserMembership $NonCorrUserMembership -UserDepToAdd $UserDepToAdd -UsersToExclude $UsersToExclude -DGroupsToDel $DGroupsToDel
 
-    # 10. Формирование сводной HTML-таблицы
-    $SummaryTableHtml = Get-SummaryHtmlTable -NonCorrADGroup $NonCorrADGroup -NCMUpload $NCMUpload -NonCorrUserMembership $NonCorrUserMembership -UserDepToAdd $UserDepToAdd -UsersToExclude $UsersToExclude -DGroupsToDel $DGroupsToDel -DGroupsToRename $DGroupsToRename
-
-    # 11. Подготовка вложений (только файлы, в которых есть данные)
+    # 10. Подготовка вложений (только файлы, в которых есть данные)
     $Attachments = @()
     if ((Get-RecordCount $NonCorrADGroup) -gt 0)        { $Attachments += $Csv_NonCorrADGroup }
     if ((Get-RecordCount $NCMUpload) -gt 0)             { $Attachments += $Csv_NCMUpload }
@@ -648,9 +579,8 @@ try {
     if ((Get-RecordCount $UserDepToAdd) -gt 0)          { $Attachments += $Csv_UserDepToAdd }
     if ((Get-RecordCount $UsersToExclude) -gt 0)        { $Attachments += $Csv_UsersToExclude }
     if ((Get-RecordCount $DGroupsToDel) -gt 0)          { $Attachments += $Csv_DGroupsToDel }
-    if ((Get-RecordCount $DGroupsToRename) -gt 0)       { $Attachments += $Csv_DGroupsToRename }
 
-    # 12. Отправка итогового письма
+    # 11. Отправка итогового письма
     Send-Notification -TableHtml $SummaryTableHtml -Attachments $Attachments
 
     Out-Log "=== Успешное завершение ==="
