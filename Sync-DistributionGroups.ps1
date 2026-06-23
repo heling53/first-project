@@ -228,7 +228,13 @@ try {
     foreach ($row in $excelData) {
         $childName  = if ($row.objFullName) { ($row.objFullName.ToString() -replace '\s+', ' ').Trim() } else { $null }
         $parentName = if ($row.objName)     { ($row.objName.ToString()     -replace '\s+', ' ').Trim() } else { $null }
-        $managerEN  = if ($row.'Руководитель подразделения') { ($row.'Руководитель подразделения'.ToString().Trim() -replace '^0+', '') } else { $null }
+        # Срезаем ведущие нули у EmployeeNumber руководителя (Excel-формат "0000003966").
+        # Исключение: табельный номер "0000-00013" — единственный с дефисом, ведущие нули
+        # значимы (в AD хранится как "0000-00013"). Для него значение оставляем как есть.
+        $managerEN  = if ($row.'Руководитель подразделения') {
+            $en = $row.'Руководитель подразделения'.ToString().Trim()
+            if ($en -eq '0000-00013') { $en } else { $en -replace '^0+', '' }
+        } else { $null }
 
         if ($row.orgUnitId -and $childName) {
             $excelDeptById[$row.orgUnitId.ToString().Trim()] = $childName
