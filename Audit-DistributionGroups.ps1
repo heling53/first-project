@@ -173,8 +173,14 @@ function Import-DepartmentsFromExcel {
             $fullName = if ($fullName) { $fullName.ToString().Trim() } else { '' }
             if ([string]::IsNullOrWhiteSpace($fullName)) { continue }
 
-            # Срезаем ведущие нули у EmployeeNumber руководителя (Excel-формат "0000003966")
-            $managerEN = if ($managerEN) { ($managerEN.ToString().Trim() -replace '^0+', '') } else { '' }
+            # Срезаем ведущие нули у EmployeeNumber руководителя (Excel-формат "0000003966").
+            # Исключение: руководитель с табельным номером "0000-00013" — единственный, у кого
+            # номер содержит дефис и ведущие нули значимы (в AD он хранится как "0000-00013").
+            # Для него оставляем значение как есть, иначе оно превратится в "-00013" и не совпадёт с AD.
+            $managerEN = if ($managerEN) {
+                $en = $managerEN.ToString().Trim()
+                if ($en -eq '0000-00013') { $en } else { $en -replace '^0+', '' }
+            } else { '' }
 
             $obj = [PSCustomObject]@{
                 'Уникальный идентификатор подразделения' = if ($id) { $id.ToString().Trim() } else { '' }
